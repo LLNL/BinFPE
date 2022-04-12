@@ -1,0 +1,534 @@
+diff --git a/tools/detect_fp_exceptions/common.h b/tools/detect_fp_exceptions/common.h
+index 5240e40..05be66a 100644
+--- a/tools/detect_fp_exceptions/common.h
++++ b/tools/detect_fp_exceptions/common.h
+@@ -38,4 +38,9 @@ typedef struct {
+     int32_t num_regs;
+     /* 32 lanes, each thread can store up to 5 register values */
+     uint32_t reg_vals[32][8];
++    /* code location (file, line) */
++    char *location;
+ } reg_info_t;
++
++
++
+diff --git a/tools/detect_fp_exceptions/detect_fp_exceptions.cu b/tools/detect_fp_exceptions/detect_fp_exceptions.cu
+index 61ec462..ddc68c6 100644
+--- a/tools/detect_fp_exceptions/detect_fp_exceptions.cu
++++ b/tools/detect_fp_exceptions/detect_fp_exceptions.cu
+@@ -33,6 +33,12 @@
+ #include <map>
+ #include <vector>
+ #include <unordered_set>
++#include <unordered_map>
++#include <map>
++#include <set>
++
++#define FILE_NAME_SIZE 256
++#define PATH_NAME_SIZE 5000
+ 
+ /* every tool needs to include this once */
+ #include "nvbit_tool.h"
+@@ -48,8 +54,8 @@
+ 
+ /* Channel used to communicate from GPU to CPU receiving thread */
+ #define CHANNEL_SIZE (1l << 20)
+-static __managed__ ChannelDev channel_dev;
+-static ChannelHost channel_host;
++//static __managed__ ChannelDev channel_dev;
++//static ChannelHost channel_host;
+ 
+ /* receiving thread and its control variables */
+ pthread_t recv_thread;
+@@ -84,6 +90,45 @@ void nvbit_at_init() {
+ /* Set used to avoid re-instrumenting the same functions multiple times */
+ std::unordered_set<CUfunction> already_instrumented;
+ 
++/* Tuple that specifies a code location */
++typedef std::tuple<const char*, const char*, uint32_t> LocationTuple;
++
++/* Table of line information per location */
++std::map<const LocationTuple, char *> line_information_table;
++
++/* Set of location with errors */
++//std::set<char *> erroneous_locations;
++
++/* Set of location with warnings */
++//std::set<char *> warning_locations;
++
++/* Set of analyzed kernels */
++std::set<const char *> analyzed_kernels;
++
++/* Converts a location to a string and keeps them in a cache */
++char * getLocationString(const LocationTuple &loc) {
++  char *ret = nullptr;
++  std::map<const LocationTuple, char *>::const_iterator got = line_information_table.find(loc);
++
++  if ( got == line_information_table.end() ) { /* not found */
++    char *loc_string = (char*)malloc(sizeof(char)*(FILE_NAME_SIZE+PATH_NAME_SIZE+50));
++    loc_string[0] = '\0';
++    strcat(loc_string, std::get<1>(loc));
++    strcat(loc_string, "/");
++    strcat(loc_string, std::get<0>(loc));
++    strcat(loc_string, ":");
++    uint32_t line = std::get<2>(loc);
++    strcat(loc_string, std::to_string(line).c_str());
++    std::pair<const LocationTuple, char*> tmp(loc, loc_string);
++    line_information_table.insert(tmp);
++    ret = loc_string;
++  } else { /* string found */
++    ret = got->second;
++  }
++
++  return ret;
++}
++
+ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
+     /* Get related functions of the kernel (device function that can be
+      * called by the kernel) */
+@@ -116,6 +161,12 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
+             if (verbose) {
+                 instr->printDecoded();
+             }
++           
++            /* Checks for FP64 instructions */ 
++            if( strstr(instr->getSass(), "DMUL") == NULL && 
++                strstr(instr->getSass(), "DADD") == NULL &&
++                strstr(instr->getSass(), "DFMA") == NULL)              
++              continue;
+ 
+             if (sass_to_id_map.find(instr->getSass()) ==
+                 sass_to_id_map.end()) {
+@@ -124,6 +175,28 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
+                 id_to_sass_map[opcode_id] = std::string(instr->getSass());
+             }
+ 
++            /* Get line info */
++            uint32_t offset = instr->getOffset();
++            char *file_name = (char*)malloc(sizeof(char)*FILE_NAME_SIZE);
++            file_name[0] = '\0';
++            char *dir_name = (char*)malloc(sizeof(char)*PATH_NAME_SIZE);
++            dir_name[0] = '\0';
++            uint32_t line = 0;
++            bool ret_line_info = nvbit_get_line_info(ctx, f, offset,
++                         &file_name, &dir_name, &line);
++            char * loc_str = nullptr;
++            if (ret_line_info) {
++              LocationTuple loc(file_name, dir_name, line);
++              loc_str = getLocationString(loc);
++            } else {
++              LocationTuple loc("unknown_path","", 0);
++              loc_str = getLocationString(loc);
++            }
++            /* Allocate location str in device memory */
++            char *str_device_loc = nullptr;
++            cudaMalloc(&str_device_loc, strlen(loc_str)+5);
++            cudaMemcpy(str_device_loc, loc_str, strlen(loc_str), cudaMemcpyHostToDevice);
++  
+             int opcode_id = sass_to_id_map[instr->getSass()];
+             std::vector<int> reg_num_list;
+             /* iterate on the operands */
+@@ -133,19 +206,24 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
+                 if (op->type == InstrType::OperandType::REG) {
+                     for (int reg_idx = 0; reg_idx < instr->getSize() / 4; reg_idx++) {
+                         reg_num_list.push_back(op->u.reg.num + reg_idx);
++                        reg_num_list.push_back(op->u.reg.num + reg_idx+1);
+                     }
+                 }
+             }
+             /* insert call to the instrumentation function with its
+              * arguments */
+-            nvbit_insert_call(instr, "record_reg_val", IPOINT_BEFORE);
++            //nvbit_insert_call(instr, "record_reg_val", IPOINT_BEFORE);
++            nvbit_insert_call(instr, "record_reg_val", IPOINT_AFTER);
+             /* guard predicate value */
+             nvbit_add_call_arg_guard_pred_val(instr);
+             /* opcode id */
+             nvbit_add_call_arg_const_val32(instr, opcode_id);
++            /* add pointer to location */
++            //nvbit_add_call_arg_const_val64(instr, (uint64_t)loc_str);
++            nvbit_add_call_arg_const_val64(instr, (uint64_t)str_device_loc);
+             /* add pointer to channel_dev*/
+-            nvbit_add_call_arg_const_val64(instr,
+-                                           (uint64_t)&channel_dev);
++            //nvbit_add_call_arg_const_val64(instr, (uint64_t)&channel_dev);
++            nvbit_add_call_arg_const_val64(instr, (uint64_t)0);
+             /* how many register values are passed next */
+             nvbit_add_call_arg_const_val32(instr, reg_num_list.size());
+             for (int num : reg_num_list) {
+@@ -161,12 +239,12 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
+ __global__ void flush_channel() {
+     /* push memory access with negative cta id to communicate the kernel is
+      * completed */
+-    reg_info_t ri;
+-    ri.cta_id_x = -1;
+-    channel_dev.push(&ri, sizeof(reg_info_t));
++    //reg_info_t ri;
++    //ri.cta_id_x = -1;
++    //channel_dev.push(&ri, sizeof(reg_info_t));
+ 
+     /* flush channel */
+-    channel_dev.flush();
++    //channel_dev.flush();
+ }
+ 
+ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
+@@ -191,14 +269,21 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
+ 
+             nvbit_enable_instrumented(ctx, p->f, true);
+ 
+-            printf(
+-                "Kernel %s - grid size %d,%d,%d - block size %d,%d,%d - nregs "
+-                "%d - shmem %d - cuda stream id %ld\n",
+-                nvbit_get_func_name(ctx, p->f), p->gridDimX, p->gridDimY,
+-                p->gridDimZ, p->blockDimX, p->blockDimY, p->blockDimZ, nregs,
+-                shmem_static_nbytes + p->sharedMemBytes, (uint64_t)p->hStream);
+-            recv_thread_receiving = true;
+-
++            //printf(
++            //    "Kernel %s - grid size %d,%d,%d - block size %d,%d,%d - nregs "
++            //    "%d - shmem %d - cuda stream id %ld\n",
++            //    nvbit_get_func_name(ctx, p->f), p->gridDimX, p->gridDimY,
++            //    p->gridDimZ, p->blockDimX, p->blockDimY, p->blockDimZ, nregs,
++            //    shmem_static_nbytes + p->sharedMemBytes, (uint64_t)p->hStream);
++            //recv_thread_receiving = true;
++            
++            /* Print kernel name if we have not done it before */
++            char *short_name = strdup(nvbit_get_func_name(ctx, p->f));
++            short_name[100] = '\0'; /* cut it short */
++            if (analyzed_kernels.insert(short_name).second)
++              printf("#FPCHECKER: kernel %s...\n", short_name);
++            free(short_name);
++ 
+         } else {
+             /* make sure current kernel is completed */
+             cudaDeviceSynchronize();
+@@ -214,23 +299,97 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
+ 
+             /* issue flush of channel so we are sure all the memory accesses
+              * have been pushed */
+-            flush_channel<<<1, 1>>>();
+-            cudaDeviceSynchronize();
+-            assert(cudaGetLastError() == cudaSuccess);
++            //flush_channel<<<1, 1>>>();
++            //cudaDeviceSynchronize();
++            //assert(cudaGetLastError() == cudaSuccess);
+ 
+             /* unset the skip flag */
+             skip_flag = false;
+ 
+             /* wait here until the receiving thread has not finished with the
+              * current kernel */
+-            while (recv_thread_receiving) {
+-                pthread_yield();
+-            }
++            //while (recv_thread_receiving) {
++            //    pthread_yield();
++            //}
+         }
+     }
+ }
+ 
+-void *recv_thread_fun(void *) {
++/* -------------------------------------------------------------*/
++/* Helper functions for FP64 registers                          */
++/* -------------------------------------------------------------*/
++
++/*void bin(uint32_t n) {
++    uint32_t i;
++    for (i = 1 << 31; i > 0; i = i / 2)
++        (n & i) ? printf("1") : printf("0");
++}
++
++uint64_t _FPC_FP64_GET_EXPONENT(double x) {
++  uint64_t val;
++  memcpy((void *) &val, (void *) &x, sizeof(val));
++  val = val << 1;   // get rid of sign bit
++  val = val >> 53;  // get rid of the mantissa bits
++  return val;
++}
++
++uint64_t _FPC_FP64_GET_MANTISSA(double x) {
++  uint64_t val;
++  memcpy((void *) &val, (void *) &x, sizeof(val));
++  val = val << 12;   // get rid of sign bit and exponent
++  val = val >> 12;
++  return val;
++}
++
++int _FPC_FP64_IS_INF(double x) {
++  if  (_FPC_FP64_GET_EXPONENT(x) == (uint64_t)(2047) &&
++      _FPC_FP64_GET_MANTISSA(x) == (uint64_t)(0)
++      )
++    return 1;
++  return 0;
++}
++
++int _FPC_FP64_IS_NAN(double x) {
++  if (isnan(x))
++      return 1;
++  return 0;
++}
++
++int _FPC_FP64_IS_SUBNORMAL(double x) {
++  int ret = 0;
++  uint64_t val = _FPC_FP64_GET_EXPONENT(x);
++  if (x != 0.0 && x != -0.0)
++  {
++    if (val == 0)
++      ret = 1;
++  }
++  return ret;
++}
++
++bool CHECK_EXCEPTION(double x, char *loc) {
++  if (_FPC_FP64_IS_NAN(x)) {
++    if (erroneous_locations.insert(loc).second)
++      printf("#FPCHECKER: NaN found @ %s\n", loc);
++      return true;
++  } else if (_FPC_FP64_IS_INF(x)) {
++    if (erroneous_locations.insert(loc).second)
++      printf("#FPCHECKER: INF found @ %s\n", loc);
++      return true;
++  }
++
++  if (_FPC_FP64_IS_SUBNORMAL(x)) {
++    if (warning_locations.insert(loc).second)
++      printf("#FPCHECKER: Warning: very small quantity (%.17g) @ %s\n", x, loc);
++      return true;
++  }
++
++  return false;
++} */
++
++/* -------------------------------------------------------------*/
++/* -------------------------------------------------------------*/
++
++/*void *recv_thread_fun(void *) {
+     char *recv_buffer = (char *)malloc(CHANNEL_SIZE);
+ 
+     while (recv_thread_started) {
+@@ -243,44 +402,59 @@ void *recv_thread_fun(void *) {
+                 reg_info_t *ri =
+                     (reg_info_t *)&recv_buffer[num_processed_bytes];
+ 
+-                /* when we get this cta_id_x it means the kernel has completed
+-                 */
++                // when we get this cta_id_x it means the kernel has completed
+                 if (ri->cta_id_x == -1) {
+                     recv_thread_receiving = false;
+                     break;
+                 }
+ 
+-                printf("CTA %d,%d,%d - warp %d - %s:\n", ri->cta_id_x,
+-                       ri->cta_id_y, ri->cta_id_z, ri->warp_id,
+-                       id_to_sass_map[ri->opcode_id].c_str());
++                //printf("CTA %d,%d,%d - warp %d - %s:\n", ri->cta_id_x,
++                //       ri->cta_id_y, ri->cta_id_z, ri->warp_id,
++                //       id_to_sass_map[ri->opcode_id].c_str());
++
++                //printf("ri->num_regs: %d\n", ri->num_regs);
++                //for (int reg_idx = 0; reg_idx < ri->num_regs; reg_idx++) {
++                //for (int reg_idx = 0; reg_idx < ri->num_regs; reg_idx = reg_idx+2) {
++                    //printf("* ");
++                    //for (int i = 0; i < 32; i++) {
++                    //    printf("Reg%d_T%d: 0x%08x ", reg_idx, i,
++                    //           ri->reg_vals[i][reg_idx]);
++                    //}
++                    //printf("\n");
+ 
+-                for (int reg_idx = 0; reg_idx < ri->num_regs; reg_idx++) {
+-                    printf("* ");
+                     for (int i = 0; i < 32; i++) {
+-                        printf("Reg%d_T%d: 0x%08x ", reg_idx, i,
+-                               ri->reg_vals[i][reg_idx]);
++                      //uint32_t lo_fp64 = ri->reg_vals[i][reg_idx+1];
++                      //uint32_t hi_fp64 = ri->reg_vals[i][reg_idx];
++                      uint32_t lo_fp64 = ri->reg_vals[i][1];
++                      uint32_t hi_fp64 = ri->reg_vals[i][0];
++                      uint64_t result_int = (uint64_t) lo_fp64 << 32 | hi_fp64;
++                      double result = 0.0;
++                      memcpy((void *) &result, (void *) &result_int, sizeof(result_int));
++                      if (CHECK_EXCEPTION(result, ri->location)) {
++                        break;
++                      }
+                     }
+-                    printf("\n");
+-                }
++                //}
+ 
+-                printf("\n");
++                //printf("\n");
+                 num_processed_bytes += sizeof(reg_info_t);
+             }
+         }
+     }
+     free(recv_buffer);
+     return NULL;
+-}
++} */
+ 
+ void nvbit_at_ctx_init(CUcontext ctx) {
+-    recv_thread_started = true;
+-    channel_host.init(0, CHANNEL_SIZE, &channel_dev, NULL);
+-    pthread_create(&recv_thread, NULL, recv_thread_fun, NULL);
++    printf("#FPCHECKER: Initializing...\n");
++    //recv_thread_started = true;
++    //channel_host.init(0, CHANNEL_SIZE, &channel_dev, NULL);
++    //pthread_create(&recv_thread, NULL, recv_thread_fun, NULL);
+ }
+ 
+ void nvbit_at_ctx_term(CUcontext ctx) {
+-    if (recv_thread_started) {
+-        recv_thread_started = false;
+-        pthread_join(recv_thread, NULL);
+-    }
++    //if (recv_thread_started) {
++    //    recv_thread_started = false;
++    //    pthread_join(recv_thread, NULL);
++    //}
+ }
+diff --git a/tools/detect_fp_exceptions/inject_funcs.cu b/tools/detect_fp_exceptions/inject_funcs.cu
+index b52e443..9e875f3 100644
+--- a/tools/detect_fp_exceptions/inject_funcs.cu
++++ b/tools/detect_fp_exceptions/inject_funcs.cu
+@@ -28,6 +28,8 @@
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <cstdarg>
++//#include <set>
++//#include <thrust/device_vector.h>
+ 
+ #include "utils/utils.h"
+ 
+@@ -37,7 +39,94 @@
+ /* contains definition of the mem_access_t structure */
+ #include "common.h"
+ 
++/* -------------------------------------------------------------*/
++/* Helper functions for FP64 registers                          */
++/* -------------------------------------------------------------*/
++
++/* Set of location with errors */
++//__device__ std::set<char *> erroneous_locations = {};
++
++/* Set of location with warnings */
++//__device__ std::set<char *> warning_locations = {};
++
++#define NUM_WARNING_REPORTS 3
++#define NUM_ERROR_REPORTS 10
++__device__ int warning_counter = 0;
++__device__ int error_counter = 0;
++
++__device__ __noinline__ uint64_t _FPC_FP64_GET_EXPONENT(double x) {
++  uint64_t val;
++  memcpy((void *) &val, (void *) &x, sizeof(val));
++  val = val << 1;   // get rid of sign bit
++  val = val >> 53;  // get rid of the mantissa bits
++  return val;
++}
++
++__device__ __noinline__ uint64_t _FPC_FP64_GET_MANTISSA(double x) {
++  uint64_t val;
++  memcpy((void *) &val, (void *) &x, sizeof(val));
++  val = val << 12;   // get rid of sign bit and exponent
++  val = val >> 12;
++  return val;
++}
++
++__device__ __noinline__ int _FPC_FP64_IS_INF(double x) {
++  if  (_FPC_FP64_GET_EXPONENT(x) == (uint64_t)(2047) &&
++      _FPC_FP64_GET_MANTISSA(x) == (uint64_t)(0)
++      )
++    return 1;
++  return 0;
++}
++
++__device__ __noinline__ int _FPC_FP64_IS_NAN(double x) {
++  if (isnan(x))
++      return 1;
++  return 0;
++}
++
++__device__ __noinline__ int _FPC_FP64_IS_SUBNORMAL(double x) {
++  int ret = 0;
++  uint64_t val = _FPC_FP64_GET_EXPONENT(x);
++  if (x != 0.0 && x != -0.0)
++  {
++    if (val == 0)
++      ret = 1;
++  }
++  return ret;
++}
++
++__device__ __noinline__ bool CHECK_EXCEPTION(double x, char *loc) {
++  if (_FPC_FP64_IS_NAN(x)) {
++      if (error_counter < NUM_ERROR_REPORTS) {
++        printf("#FPCHECKER: NaN found @ %s\n", loc);
++        error_counter++;
++      }
++    return true;
++  } else if (_FPC_FP64_IS_INF(x)) {
++      if (error_counter < NUM_ERROR_REPORTS) {
++        printf("#FPCHECKER: INF found @ %s\n", loc);
++        error_counter++;
++      }
++    return true;
++  }
++
++  //if (_FPC_FP64_IS_SUBNORMAL(x)) {
++  //  if (warning_counter < NUM_WARNING_REPORTS) {
++  //      printf("#FPCHECKER: Warning: very small quantity (%.17g) @ %s\n", x, loc);
++  //      warning_counter++;
++  //  }
++  //  return true;
++  //}
++
++  return false;
++}
++
++/* -------------------------------------------------------------*/
++/* -------------------------------------------------------------*/
++
++
+ extern "C" __device__ __noinline__ void record_reg_val(int pred, int opcode_id,
++                                                       uint64_t location,
+                                                        uint64_t pchannel_dev,
+                                                        int32_t num_regs...) {
+     if (!pred) {
+@@ -57,6 +146,7 @@ extern "C" __device__ __noinline__ void record_reg_val(int pred, int opcode_id,
+     ri.warp_id = get_warpid();
+     ri.opcode_id = opcode_id;
+     ri.num_regs = num_regs;
++    ri.location = (char*)location;
+ 
+     if (num_regs) {
+         va_list vl;
+@@ -68,6 +158,17 @@ extern "C" __device__ __noinline__ void record_reg_val(int pred, int opcode_id,
+             /* collect register values from other threads */
+             for (int tid = 0; tid < 32; tid++) {
+                 ri.reg_vals[tid][i] = __shfl_sync(active_mask, val, tid);
++
++                /* Detect error */
++                uint32_t lo_fp64 = ri.reg_vals[tid][1];
++                uint32_t hi_fp64 = ri.reg_vals[tid][0];
++                uint64_t result_int = (uint64_t) lo_fp64 << 32 | hi_fp64;
++                double result = 0.0;
++                memcpy((void *) &result, (void *) &result_int, sizeof(result_int));
++                if (CHECK_EXCEPTION(result, ri.location)) {
++                //  break;
++                }
++ 
+             }
+         }
+         va_end(vl);
+@@ -75,7 +176,7 @@ extern "C" __device__ __noinline__ void record_reg_val(int pred, int opcode_id,
+ 
+     /* first active lane pushes information on the channel */
+     if (first_laneid == laneid) {
+-        ChannelDev *channel_dev = (ChannelDev *)pchannel_dev;
+-        channel_dev->push(&ri, sizeof(reg_info_t));
++        //ChannelDev *channel_dev = (ChannelDev *)pchannel_dev;
++        //channel_dev->push(&ri, sizeof(reg_info_t));
+     }
+ }

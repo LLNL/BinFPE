@@ -1,0 +1,34 @@
+
+all: fetch
+
+tarball = nvbit-Linux-ppc64le-1.5.4.tar.bz2
+
+$(tarball):
+	curl -LO https://github.com/NVlabs/NVBit/releases/download/1.5.4/$@
+
+nvbit_release: $(tarball)
+	tar -xjf $<
+
+patch: nvbit_release
+
+
+tar -xjf nvbit-Linux-ppc64le-1.5.4.tar.bz2
+
+# Duplicate tool in NVBit
+cp -r nvbit_release/tools/record_reg_vals nvbit_release/tools/detect_fp_exceptions
+mv nvbit_release/tools/detect_fp_exceptions/record_reg_vals.cu  nvbit_release/tools/detect_fp_exceptions/detect_fp_exceptions.cu
+
+# Copy tests
+cp -r ./tests ./nvbit_release/tools/detect_fp_exceptions
+
+# Copy patches
+cp ./src/*.patch ./nvbit_release/tools/detect_fp_exceptions
+
+# Patch files
+cd ./nvbit_release/tools/detect_fp_exceptions
+patch < common.h.patch
+patch < inject_funcs.cu.patch
+patch < detect_fp_exceptions.cu.patch
+
+# Build tool
+make
