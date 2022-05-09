@@ -46,7 +46,13 @@ For questions, contact Ignacio Laguna <ilaguna@llnl.gov>.
 To cite `BinFPE` please use
 
 ```
-TBD
+@inproceedings{soap22-binfpe,
+author = {Ignacio Laguna and Xinyi Li and Ganesh Gopalakrishnan},
+title = {{BinFPE: Accurate Floating-Point Exception Detection for GPU Applications}},
+booktitle = {{11th ACM SIGPLAN International Workshop on the State Of the Art in Program Analysis (SOAP)}},
+howpublished = {{\url{https://pldi22.sigplan.org/home/SOAP-2022#event-overview}}},
+year = 2022
+}
 ```
 
 ## License
